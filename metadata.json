@@ -1,0 +1,8 @@
+{
+  "name": "VisionAlly AI",
+  "description": "An AI-powered assistive system for the blind and color-blind, providing real-time object detection, OCR, color recognition, and distance estimation with audio feedback.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
