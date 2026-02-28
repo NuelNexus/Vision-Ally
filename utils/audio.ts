@@ -46,9 +46,25 @@ export function speak(text: string, rate: number = 1.0) {
   window.speechSynthesis.cancel();
   
   // Remove markdown formatting like **bold** or *italic*
-  const cleanText = text.replace(/\*/g, '').trim();
+  // Also remove technical labels like box_2d[123, 456]
+  const cleanText = text
+    .replace(/\*/g, '')
+    .replace(/box_\w+\[.*?\]/g, '')
+    .replace(/box_\w+/g, '')
+    .trim();
   
   const utterance = new SpeechSynthesisUtterance(cleanText);
   utterance.rate = rate;
+  
+  // Try to find a female voice
+  const voices = window.speechSynthesis.getVoices();
+  const femaleVoice = voices.find(v => 
+    v.name.toLowerCase().includes('female') || 
+    v.name.toLowerCase().includes('google uk english female') ||
+    v.name.toLowerCase().includes('samantha') ||
+    v.name.toLowerCase().includes('victoria')
+  );
+  if (femaleVoice) utterance.voice = femaleVoice;
+
   window.speechSynthesis.speak(utterance);
 }

@@ -9,8 +9,8 @@ interface LiveAssistantProps {
   onClose: () => void;
 }
 
-const FRAME_RATE = 1; 
-const JPEG_QUALITY = 0.5;
+const FRAME_RATE = 2; 
+const JPEG_QUALITY = 0.7;
 
 type DetectionMode = 'object' | 'text' | 'color';
 
@@ -19,6 +19,8 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
   const [status, setStatus] = useState('Initializing...');
   const [isProcessingAction, setIsProcessingAction] = useState<DetectionMode | null>(null);
   
+  const isActiveRef = useRef(false);
+  
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -26,16 +28,39 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
   const sessionRef = useRef<any>(null);
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const autonomousTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  const cleanup = useCallback(() => {
+  const cleanup = useCallback(async () => {
     setIsActive(false);
+    isActiveRef.current = false;
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    if (autonomousTimeoutRef.current) {
+      clearTimeout(autonomousTimeoutRef.current);
+      autonomousTimeoutRef.current = null;
+    }
     if (sessionRef.current) {
+      try {
+        await sessionRef.current.close();
+      } catch (e) {
+        console.warn('Error closing session:', e);
+      }
       sessionRef.current = null;
     }
-    sourcesRef.current.forEach(s => s.stop());
+    sourcesRef.current.forEach(s => {
+      try { s.stop(); } catch (e) {}
+    });
     sourcesRef.current.clear();
-    if (audioContextRef.current) audioContextRef.current.close();
-    if (outputAudioContextRef.current) outputAudioContextRef.current.close();
+    
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      try { await audioContextRef.current.close(); } catch (e) {}
+    }
+    if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
+      try { await outputAudioContextRef.current.close(); } catch (e) {}
+    }
   }, []);
 
   const handleSnapshotAction = async (mode: DetectionMode) => {
@@ -55,9 +80,9 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
       const imageData = canvasRef.current.toDataURL('image/jpeg', 0.8).split(',')[1];
       
       const prompts = {
-        object: "Identify the main objects in this image and their approximate distance. Be extremely concise. No markdown.",
+        object: "Identify the main objects in this image and their approximate distance. Be extremely concise. Do NOT use bounding boxes or coordinates. No markdown.",
         text: "Extract and read all text from this image. Do not use any markdown formatting.",
-        color: `Identify the dominant colors for a user with ${settings.colorBlindType}. Be concise and avoid markdown.`
+        color: `Identify the dominant colors in this scene. For a user with ${settings.colorBlindType}, explain what these colors are in plain English (e.g., 'The shirt is forest green'). Be precise and avoid markdown.`
       };
 
       const response = await ai.models.generateContent({
@@ -93,7 +118,10 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
 
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: true, 
-        video: settings.cameraType === 'browser' ? { facingMode: 'environment' } : false 
+        video: settings.cameraType === 'browser' ? { 
+          deviceId: settings.selectedDeviceId ? { exact: settings.selectedDeviceId } : undefined,
+          facingMode: settings.selectedDeviceId ? undefined : 'environment' 
+        } : false 
       });
 
       if (settings.cameraType === 'browser' && videoRef.current) {
@@ -101,13 +129,21 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
       }
 
       const systemInstruction = `
-        You are VisionAlly for blind and color-blind users.
+        You are VisionAlly, a proactive AI assistant for blind and color-blind users.
         User Condition: ${settings.colorBlindType}.
-        Provide concise environment updates. Do not use markdown (no asterisks).
+        
+        Your goal is to provide real-time, autonomous audio descriptions of the environment.
+        - Be proactive: Describe changes in the scene, obstacles, or interesting objects.
+        - **Avoid Repetition**: Do not repeat the exact same descriptions. If the main objects haven't changed, look for new details, secondary objects, or different aspects of the environment to describe so the user gets a richer understanding over time.
+        - **No Technical Data**: Do NOT include bounding boxes, coordinates, or labels like "box_2d". Describe objects naturally (e.g., "A chair is about two meters ahead").
+        - Be concise: Use short, clear sentences.
+        - Color Accuracy: Pay close attention to colors. Describe them clearly (e.g., "bright red", "navy blue").
+        - No Markdown: Do not use asterisks or any markdown formatting.
+        - Tone: Professional, helpful, and calm.
       `;
 
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -118,12 +154,23 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
         callbacks: {
           onopen: () => {
             setIsActive(true);
+            isActiveRef.current = true;
             setStatus('Active');
             speak("Assistant ready.");
+
+            // Jumpstart the autonomous description
+            sessionPromise.then(s => {
+              if (s && isActiveRef.current) {
+                s.sendRealtimeInput({
+                  text: "I am ready. Please start describing my surroundings and any colors you see."
+                });
+              }
+            });
             
             const source = audioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
             scriptProcessor.onaudioprocess = (e) => {
+              if (!isActiveRef.current) return;
               const inputData = e.inputBuffer.getChannelData(0);
               const l = inputData.length;
               const int16 = new Int16Array(l);
@@ -132,12 +179,17 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
                 data: encodeAudio(new Uint8Array(int16.buffer)),
                 mimeType: 'audio/pcm;rate=16000',
               };
-              sessionPromise.then(s => s.sendRealtimeInput({ media: pcmBlob }));
+              sessionPromise.then(s => {
+                if (s && isActiveRef.current) {
+                  s.sendRealtimeInput({ media: pcmBlob });
+                }
+              });
             };
             source.connect(scriptProcessor);
             scriptProcessor.connect(audioContextRef.current!.destination);
 
             const interval = setInterval(() => {
+              if (!isActiveRef.current) return;
               if (!canvasRef.current || (!videoRef.current && settings.cameraType === 'browser')) return;
               const ctx = canvasRef.current.getContext('2d');
               if (!ctx) return;
@@ -151,45 +203,85 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
                 img.crossOrigin = "Anonymous";
                 img.src = `${settings.esp32Url}?cache=${Date.now()}`;
                 img.onload = () => {
-                   canvasRef.current!.width = img.width;
-                   canvasRef.current!.height = img.height;
-                   ctx.drawImage(img, 0, 0);
+                   if (canvasRef.current && isActiveRef.current) {
+                     canvasRef.current.width = img.width;
+                     canvasRef.current.height = img.height;
+                     const innerCtx = canvasRef.current.getContext('2d');
+                     innerCtx?.drawImage(img, 0, 0);
+                   }
                 };
               }
 
               canvasRef.current.toBlob(async (blob) => {
-                if (blob) {
+                if (blob && isActiveRef.current) {
                   const reader = new FileReader();
                   reader.onloadend = () => {
                     const base64 = (reader.result as string).split(',')[1];
-                    sessionPromise.then(s => s.sendRealtimeInput({
-                      media: { data: base64, mimeType: 'image/jpeg' }
-                    }));
+                    sessionPromise.then(s => {
+                      if (s && isActiveRef.current) {
+                        s.sendRealtimeInput({
+                          media: { data: base64, mimeType: 'image/jpeg' }
+                        });
+                      }
+                    });
                   };
                   reader.readAsDataURL(blob);
                 }
               }, 'image/jpeg', JPEG_QUALITY);
             }, 1000 / FRAME_RATE);
 
-            (sessionRef as any).currentInterval = interval;
+            intervalRef.current = interval;
+
+            // Autonomous periodic updates with overlap prevention
+            const runAutonomousUpdate = async () => {
+              if (!isActiveRef.current) return;
+              
+              try {
+                const session = await sessionPromise;
+                if (session && sourcesRef.current.size === 0) {
+                  session.sendRealtimeInput({
+                    text: "Provide a brief update. If the main scene is the same as before, describe new details, textures, or secondary objects you haven't mentioned yet. Do not repeat your previous sentences. Do NOT use bounding boxes or coordinates."
+                  });
+                  // Schedule next check in 15 seconds
+                  autonomousTimeoutRef.current = setTimeout(runAutonomousUpdate, 15000);
+                } else {
+                  // If busy or no session, check again in 3 seconds
+                  autonomousTimeoutRef.current = setTimeout(runAutonomousUpdate, 3000);
+                }
+              } catch (err) {
+                console.error("Autonomous update error:", err);
+                autonomousTimeoutRef.current = setTimeout(runAutonomousUpdate, 5000);
+              }
+            };
+
+            // Initial delay before first autonomous update
+            autonomousTimeoutRef.current = setTimeout(runAutonomousUpdate, 10000);
           },
           onmessage: async (message: LiveServerMessage) => {
+            if (!isActiveRef.current) return;
             const audioBase64 = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (audioBase64 && outputAudioContextRef.current) {
-              const ctx = outputAudioContextRef.current;
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              const buffer = await decodeAudioData(decodeAudio(audioBase64), ctx, 24000, 1);
-              const source = ctx.createBufferSource();
-              source.buffer = buffer;
-              source.connect(ctx.destination);
-              source.onended = () => sourcesRef.current.delete(source);
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += buffer.duration;
-              sourcesRef.current.add(source);
+            if (audioBase64 && outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
+              try {
+                const ctx = outputAudioContextRef.current;
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                const buffer = await decodeAudioData(decodeAudio(audioBase64), ctx, 24000, 1);
+                if (ctx.state === 'closed') return;
+                const source = ctx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(ctx.destination);
+                source.onended = () => sourcesRef.current.delete(source);
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += buffer.duration;
+                sourcesRef.current.add(source);
+              } catch (e) {
+                console.warn('Error playing audio chunk:', e);
+              }
             }
 
             if (message.serverContent?.interrupted) {
-              sourcesRef.current.forEach(s => s.stop());
+              sourcesRef.current.forEach(s => {
+                try { s.stop(); } catch (e) {}
+              });
               sourcesRef.current.clear();
               nextStartTimeRef.current = 0;
             }
@@ -217,7 +309,6 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
     startSession();
     return () => {
       cleanup();
-      if ((sessionRef as any).currentInterval) clearInterval((sessionRef as any).currentInterval);
     };
   }, []);
 
@@ -229,7 +320,7 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
           autoPlay 
           playsInline 
           muted 
-          className="absolute inset-0 w-full h-full object-cover opacity-60 grayscale"
+          className="absolute inset-0 w-full h-full object-cover opacity-60"
         />
       )}
       <canvas ref={canvasRef} className="hidden" />

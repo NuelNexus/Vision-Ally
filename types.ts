@@ -16,6 +16,7 @@ export interface UserSettings {
   voiceSpeed: number;
   cameraType: 'browser' | 'esp32';
   esp32Url: string;
+  selectedDeviceId?: string;
 }
 
 export interface DetectionResult {
