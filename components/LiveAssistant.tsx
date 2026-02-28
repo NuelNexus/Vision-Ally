@@ -18,8 +18,10 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
   const [isActive, setIsActive] = useState(false);
   const [status, setStatus] = useState('Initializing...');
   const [isProcessingAction, setIsProcessingAction] = useState<DetectionMode | null>(null);
+  const [isAutonomous, setIsAutonomous] = useState(false);
   
   const isActiveRef = useRef(false);
+  const isAutonomousRef = useRef(false);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -30,13 +32,20 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const autonomousTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const autonomousScanIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const cleanup = useCallback(async () => {
     setIsActive(false);
     isActiveRef.current = false;
+    setIsAutonomous(false);
+    isAutonomousRef.current = false;
     if (intervalRef.current) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
+    }
+    if (autonomousScanIntervalRef.current) {
+      clearInterval(autonomousScanIntervalRef.current);
+      autonomousScanIntervalRef.current = null;
     }
     if (autonomousTimeoutRef.current) {
       clearTimeout(autonomousTimeoutRef.current);
@@ -108,6 +117,61 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
     }
   };
 
+  const handleAutonomousScan = async () => {
+    if (!isActiveRef.current || !canvasRef.current || isProcessingAction) return;
+    
+    // Don't interrupt if the live model is currently speaking
+    if (sourcesRef.current.size > 0) return;
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const imageData = canvasRef.current.toDataURL('image/jpeg', 0.8).split(',')[1];
+      
+      const prompt = "Perform a comprehensive autonomous scan. 1. Identify main objects and distances. 2. Read any visible text. 3. Identify dominant colors for a user with " + settings.colorBlindType + ". Be extremely concise, natural, and do NOT use technical labels or bounding boxes. No markdown.";
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { inlineData: { mimeType: 'image/jpeg', data: imageData } },
+              { text: prompt }
+            ]
+          }
+        ]
+      });
+
+      if (isActiveRef.current && isAutonomousRef.current) {
+        const resultText = response.text || "";
+        if (resultText) {
+          speak(resultText, settings.voiceSpeed);
+        }
+      }
+    } catch (error) {
+      console.error('Autonomous scan error:', error);
+    }
+  };
+
+  useEffect(() => {
+    isAutonomousRef.current = isAutonomous;
+    if (isAutonomous) {
+      speak("Autonomous detection enabled.");
+      autonomousScanIntervalRef.current = setInterval(handleAutonomousScan, 15000);
+    } else {
+      if (autonomousScanIntervalRef.current) {
+        clearInterval(autonomousScanIntervalRef.current);
+        autonomousScanIntervalRef.current = null;
+        speak("Autonomous detection disabled.");
+      }
+    }
+    return () => {
+      if (autonomousScanIntervalRef.current) {
+        clearInterval(autonomousScanIntervalRef.current);
+      }
+    };
+  }, [isAutonomous]);
+
   const startSession = async () => {
     try {
       setStatus('Connecting...');
@@ -133,9 +197,10 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
         User Condition: ${settings.colorBlindType}.
         
         Your goal is to provide real-time, autonomous audio descriptions of the environment.
+        - **Frequency**: Every 15 seconds, provide a brief update on the environment. If the main objects haven't changed, look for new details, textures, or secondary objects to describe.
         - Be proactive: Describe changes in the scene, obstacles, or interesting objects.
-        - **Avoid Repetition**: Do not repeat the exact same descriptions. If the main objects haven't changed, look for new details, secondary objects, or different aspects of the environment to describe so the user gets a richer understanding over time.
-        - **No Technical Data**: Do NOT include bounding boxes, coordinates, or labels like "box_2d". Describe objects naturally (e.g., "A chair is about two meters ahead").
+        - **Avoid Repetition**: Do not repeat the exact same descriptions.
+        - **No Technical Data**: Do NOT include bounding boxes, coordinates, or labels like "box_2d". Describe objects naturally.
         - Be concise: Use short, clear sentences.
         - Color Accuracy: Pay close attention to colors. Describe them clearly (e.g., "bright red", "navy blue").
         - No Markdown: Do not use asterisks or any markdown formatting.
@@ -143,7 +208,7 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
       `;
 
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -158,15 +223,6 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
             setStatus('Active');
             speak("Assistant ready.");
 
-            // Jumpstart the autonomous description
-            sessionPromise.then(s => {
-              if (s && isActiveRef.current) {
-                s.sendRealtimeInput({
-                  text: "I am ready. Please start describing my surroundings and any colors you see."
-                });
-              }
-            });
-            
             const source = audioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
             scriptProcessor.onaudioprocess = (e) => {
@@ -175,13 +231,13 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
               const l = inputData.length;
               const int16 = new Int16Array(l);
               for (let i = 0; i < l; i++) int16[i] = inputData[i] * 32768;
-              const pcmBlob: Blob = {
+              const audioPart = {
                 data: encodeAudio(new Uint8Array(int16.buffer)),
                 mimeType: 'audio/pcm;rate=16000',
               };
               sessionPromise.then(s => {
                 if (s && isActiveRef.current) {
-                  s.sendRealtimeInput({ media: pcmBlob });
+                  s.sendRealtimeInput({ media: audioPart });
                 }
               });
             };
@@ -239,9 +295,10 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
               try {
                 const session = await sessionPromise;
                 if (session && sourcesRef.current.size === 0) {
-                  session.sendRealtimeInput({
-                    text: "Provide a brief update. If the main scene is the same as before, describe new details, textures, or secondary objects you haven't mentioned yet. Do not repeat your previous sentences. Do NOT use bounding boxes or coordinates."
-                  });
+                  // We can't send text via sendRealtimeInput, so we rely on the system instruction
+                  // and the continuous video stream. If the model is silent, we can try to 
+                  // "poke" it by sending a redundant video frame or just wait for its proactivity.
+                  
                   // Schedule next check in 15 seconds
                   autonomousTimeoutRef.current = setTimeout(runAutonomousUpdate, 15000);
                 } else {
@@ -338,6 +395,16 @@ export const LiveAssistant: React.FC<LiveAssistantProps> = ({ settings, onClose 
           <div className="text-white font-black text-2xl uppercase tracking-widest animate-pulse">Scanning</div>
         </div>
       )}
+
+      {/* Autonomous Toggle Button */}
+      <div className="z-20 w-full px-1 pb-1 bg-zinc-900">
+        <button 
+          onClick={() => setIsAutonomous(!isAutonomous)}
+          className={`w-full py-4 rounded transition-all font-black uppercase text-xs border-2 ${isAutonomous ? 'bg-white text-black border-white' : 'bg-zinc-800 text-white border-zinc-700'}`}
+        >
+          {isAutonomous ? 'Autonomous Detection: ON' : 'Autonomous Detection: OFF'}
+        </button>
+      </div>
 
       {/* Manual Action Buttons - White theme, no emojis */}
       <div className="mt-auto z-20 w-full grid grid-cols-3 gap-1 p-1 bg-zinc-900 border-t border-zinc-800">
